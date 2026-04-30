@@ -1,0 +1,14 @@
+# Binaries
+nexusd
+nexus-bootnode
+nexus-final
+nexus-service
+main
+
+# Data & Secrets
+data_nexus/
+internal/nexus_identity.json
+*.log
+
+# Build artifacts
+build/*.wasm
