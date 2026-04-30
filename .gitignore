@@ -1,9 +1,9 @@
 # Binaries
-nexusd
-nexus-bootnode
-nexus-final
-nexus-service
-main
+./nexusd
+./nexus-bootnode
+./nexus-final
+./nexus-service
+./main
 
 # Data & Secrets
 data_nexus/
@@ -12,3 +12,4 @@ internal/nexus_identity.json
 
 # Build artifacts
 build/*.wasm
+.cloud_api.key
