@@ -6,7 +6,7 @@ BINARY_BOOT = nexus-bootnode
 SOURCE_NEXUS = ./cmd/nexusd/main.go
 SOURCE_BOOT = ./cmd/nexus-bootnode/main.go
 
-.PHONY: all build build-nexus build-boot clean help
+.PHONY: all build build-nexus init build-boot clean help
 
 all: build
 
@@ -18,12 +18,15 @@ build-nexus:
 	go build -o $(BINARY_NEXUS) $(SOURCE_NEXUS)
 	@echo "✅ Selesai: ./$(BINARY_NEXUS)"
 
+init:
+	@echo "🌐 Menyiapkan Identitas Baru BVM Nexus..."
+	go run internal/generator_kunci.go
+
 build-boot:
 	@echo "🔨 Membangun BVM Nexus Bootnode (Mercusuar)..."
 	go build -o $(BINARY_BOOT) $(SOURCE_BOOT)
 	@echo "✅ Selesai: ./$(BINARY_BOOT)"
 
-# Membersihkan sisa perang
 clean:
 	@echo "🧹 Membersihkan binary dan log..."
 	rm -f $(BINARY_NEXUS) $(BINARY_BOOT) nexus.log

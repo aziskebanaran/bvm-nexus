@@ -14,6 +14,7 @@ import (
     nexusP2P "github.com/aziskebanaran/bvm-nexus/pkg/p2p"
     "github.com/aziskebanaran/bvm-nexus/pkg/rpc"
     "github.com/aziskebanaran/bvm-nexus/pkg/state"
+    "github.com/aziskebanaran/bvm-nexus/pkg/snapshot"
     "github.com/ipfs/go-log/v2"
 )
 
@@ -65,34 +66,40 @@ func main() {
         }
     }()
 
-// 8. API Handler Setup
-handler := &rpc.NexusHandler{
-    Store:   nexusStore,
-    CoreURL: coreAddr,
-}
+
+    // 8. API Handler Setup (Koordinat Perubahan Jenderal di Sini)
+    handler := &rpc.NexusHandler{
+        Store:      nexusStore,
+        CoreURL:    coreAddr,
+        CoreClient: c, // 🚩 PASANG UNIT CLIENT DI SINI (menggunakan variabel 'c' yang sudah dibuat di atas)
+    }
 
 // --- REGISTRASI ROUTE (EDISI GABUNGAN TERKUAT) ---
 
 // 1. RUTE SPESIFIK (Dahulukan rute yang butuh penanganan khusus)
-
 http.HandleFunc("/api/discover-core", handler.MinerDiscoveryHandler)
-http.HandleFunc("/api/wallet/create", handler.HandleCreateWallet) // Wajib agar Wallet TS sinkron
-http.HandleFunc("/api/storage/sync", handler.HandleStorageSync)   // Jangan sampai hilang!
-http.HandleFunc("/get_block", handler.HandleGetBlock)             // Tetap dipertahankan
-
-// 2. RUTE INFORMASI & AUTH
-http.HandleFunc("/api/info", handler.HandleInfo)
 http.HandleFunc("/api/login", handler.HandleProxyAuth)
 http.HandleFunc("/api/nexus/status", handler.HandleNexusStatus)
 http.HandleFunc("/api/nexus/update-peers", handler.HandleUpdatePeers)
-
-// 3. RUTE P2P
 http.HandleFunc("/peers", handler.HandleGetPeers)
 http.HandleFunc("/p2p/register", handler.HandleRegisterPeer)
+http.HandleFunc("/api/balance", handler.HandleBalance)
 
-// ... rute lainnya ...
-http.HandleFunc("/api/history", handler.HandleAddressHistory) // 🚩 Tambahkan ini!
-http.HandleFunc("/api/search", handler.HandleAddressHistory)  // Alias agar /api/search juga terkonversi
+// 1. RUTE SPESIFIK
+http.HandleFunc("/api/snapshot/download", snapshot.HandleDownloadSnapshot)
+http.HandleFunc("/api/wallet/create", handler.HandleCreateWallet)
+http.HandleFunc("/api/storage/sync", handler.HandleStorageSync)
+
+// 2. RUTE DATA (Gunakan akhiran slash agar bisa baca ID di URL)
+http.HandleFunc("/api/tx/", handler.HandleGetTx)         // Menangkap /api/tx/ID
+http.HandleFunc("/api/block/", handler.HandleGetBlock)   // Menangkap /api/block/HEIGHT
+http.HandleFunc("/get_block", handler.HandleGetBlock)    // Legacy support
+
+// 3. RUTE STATE & HISTORY
+http.HandleFunc("/api/info", handler.HandleInfo)
+http.HandleFunc("/api/state", handler.HandleGetState)
+http.HandleFunc("/api/history", handler.HandleAddressHistory)
+http.HandleFunc("/api/search", handler.HandleAddressHistory)
 
 // 4. BENTENG PERTAHANAN (CATCH-ALL)
 // Kita ganti rute "/api/" yang lama dengan ini agar tidak "bertabrakan" dengan rute AI

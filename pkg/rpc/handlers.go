@@ -7,7 +7,8 @@ import (
     "time"
 	"os"
     "fmt" // Tambahkan ini
-
+	"strings"
+    "github.com/aziskebanaran/bvm-core/pkg/client"
     "github.com/aziskebanaran/bvm-core/pkg/wallet"
     "github.com/aziskebanaran/bvm-nexus/pkg/p2p" // Tambahkan ini (panggil p2p nexus)
     "github.com/aziskebanaran/bvm-core/pkg/storage"
@@ -16,33 +17,37 @@ import (
 )
 
 type NexusHandler struct {
-    Store storage.BVMStore
-    CoreURL  string
+    Store      storage.BVMStore
+    CoreURL    string
+    CoreClient *client.BVMClient
 }
 
 func (h *NexusHandler) HandleProxyMining(w http.ResponseWriter, r *http.Request) {
-    // 🚩 Gunakan h.CoreURL agar fleksibel (8080)
+    // 1. Tentukan Target (Core 8080)
     coreURL := h.CoreURL + r.URL.Path
     if r.URL.RawQuery != "" {
         coreURL += "?" + r.URL.RawQuery
     }
 
+    // 2. Gunakan NewRequest dengan r.Body
     req, err := http.NewRequest(r.Method, coreURL, r.Body)
     if err != nil {
         http.Error(w, "❌ Gagal membuat request proxy", 500)
         return
     }
 
-    // Copy Header (Penting untuk Token Bearer/Signature)
+    // 3. SALIN HEADER (Krusial untuk Autentikasi)
     for name, values := range r.Header {
         for _, value := range values {
             req.Header.Add(name, value)
         }
     }
 
-    client := &http.Client{Timeout: 10 * time.Second}
+    // 4. Client dengan Timeout sedikit lebih longgar untuk mobile
+    client := &http.Client{Timeout: 15 * time.Second}
     resp, err := client.Do(req)
     if err != nil {
+        fmt.Printf("⚠️ [NEXUS] Core Offline/Busy: %v\n", err)
         w.Header().Set("Content-Type", "application/json")
         w.WriteHeader(502)
         json.NewEncoder(w).Encode(map[string]string{"status": "ERROR", "error": "Core BVM Offline"})
@@ -50,35 +55,93 @@ func (h *NexusHandler) HandleProxyMining(w http.ResponseWriter, r *http.Request)
     }
     defer resp.Body.Close()
 
-    // Meneruskan apapun yang dijawab Core (Header & Body)
+    // 5. SALIN BALIK HEADER DARI CORE
     for k, vv := range resp.Header {
         for _, v := range vv {
             w.Header().Add(k, v)
         }
     }
+
+    // 6. KIRIM STATUS & BODY (Ini yang menghentikan EOF)
     w.WriteHeader(resp.StatusCode)
     io.Copy(w, resp.Body)
 }
 
+func (h *NexusHandler) HandleGetTx(w http.ResponseWriter, r *http.Request) {
+    // Taktik: Ambil ID dari Query (?id=) atau dari Path (/api/tx/ID)
+    txid := r.URL.Query().Get("id")
+    if txid == "" {
+        txid = strings.TrimPrefix(r.URL.Path, "/api/tx/")
+    }
 
-func (h *NexusHandler) HandleGetBlock(w http.ResponseWriter, r *http.Request) {
-    heightStr := r.URL.Query().Get("height")
-    if heightStr == "" {
-        http.Error(w, "Missing 'height' parameter", 400)
+    if txid == "" || txid == "/api/tx" {
+        http.Error(w, `{"error": "TXID required"}`, 400)
         return
     }
 
+    fmt.Printf("🕵️ [NEXUS] Mencari detail transaksi: %s\n", txid[:10])
+
+    // 1. Cek Database Lokal Nexus (Hasil Crawling)
+    var tx types.Transaction
+    // Gunakan prefix "tx:" sesuai yang kita buat di sync.go tadi
+    err := h.Store.Get("tx:"+txid, &tx)
+
+    if err == nil && tx.ID != "" {
+        w.Header().Set("Content-Type", "application/json")
+        w.Header().Set("X-Source", "NEXUS-CRAWLER-LOCAL")
+        json.NewEncoder(w).Encode(tx)
+        return
+    }
+
+    // 2. Fallback: Jika tidak ada di lokal, tanya ke Core (Proxy)
+    targetURL := fmt.Sprintf("%s/api/tx/%s", h.CoreURL, txid)
+    resp, err := http.Get(targetURL)
+    if err != nil {
+        http.Error(w, `{"error": "Core Offline"}`, 502)
+        return
+    }
+    defer resp.Body.Close()
+
+    w.Header().Set("Content-Type", "application/json")
+    io.Copy(w, resp.Body)
+}
+
+func (h *NexusHandler) HandleGetBlock(w http.ResponseWriter, r *http.Request) {
+    // Taktik: Ambil Height dari Query (?height=) atau Path (/api/block/8149)
+    heightStr := r.URL.Query().Get("height")
+    if heightStr == "" {
+        heightStr = strings.TrimPrefix(r.URL.Path, "/api/block/")
+    }
+
+    if heightStr == "" || heightStr == "/api/block" {
+        http.Error(w, "Missing block height", 400)
+        return
+    }
+
+    fmt.Printf("🧱 [NEXUS] Mengambil data blok: #%s\n", heightStr)
+
     var block types.Block
-    // 🚩 Koreksi: Pastikan key sesuai dengan storage.go di Core
+    // Prefix "b:" adalah standar storage untuk blok
     err := h.Store.Get("b:"+heightStr, &block)
+
     if err != nil || block.Hash == "" {
-        http.Error(w, "🔍 Blok tidak ditemukan di Database Nexus", 404)
+        // Fallback: Jika tidak ada di Nexus, lempar ke Core
+        targetURL := fmt.Sprintf("%s/api/block/%s", h.CoreURL, heightStr)
+        resp, err := http.Get(targetURL)
+        if err != nil {
+            http.Error(w, "Core Offline", 502)
+            return
+        }
+        defer resp.Body.Close()
+        w.Header().Set("Content-Type", "application/json")
+        io.Copy(w, resp.Body)
         return
     }
 
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(block)
 }
+
 
 func (h *NexusHandler) HandleInfo(w http.ResponseWriter, r *http.Request) {
     // 1. Ambil data mentah dari Core Status
@@ -181,7 +244,7 @@ func (h *NexusHandler) HandleStorageSync(w http.ResponseWriter, r *http.Request)
 
     // 2. Teruskan ke Core Utama Sultan (Port 8080)
     proxyReq, _ := http.NewRequest(r.Method, h.CoreURL+"/api/storage/put", r.Body)
-    
+
     // Copy Header agar Core bisa memverifikasi tanda tangan user
     proxyReq.Header.Set("X-BVM-Address", addr)
     proxyReq.Header.Set("X-BVM-Signature", sig)
@@ -210,7 +273,7 @@ func (h *NexusHandler) ProxyToCore(w http.ResponseWriter, r *http.Request) {
 // HandleProxyAuth: Jalur khusus untuk Login & Autentikasi
 func (h *NexusHandler) HandleProxyAuth(w http.ResponseWriter, r *http.Request) {
     fmt.Printf("🔐 [NEXUS] Meneruskan Permintaan Auth ke Core: %s\n", h.CoreURL)
-    
+
     // Kita gunakan mesin proxy yang sama dengan Mining agar praktis
     h.HandleProxyMining(w, r)
 }
@@ -235,10 +298,10 @@ func (h *NexusHandler) HandleRegisterPeer(w http.ResponseWriter, r *http.Request
         http.Error(w, "Invalid Payload", 400)
         return
     }
-    
+
     // Logika: Tambahkan ke sistem P2P Nexus Jenderal
     fmt.Printf("🌐 [NEXUS] SDK Mendaftarkan Peer: %s\n", req.IP)
-    
+
     w.WriteHeader(200)
     json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }
@@ -247,11 +310,11 @@ func (h *NexusHandler) HandleNexusStatus(w http.ResponseWriter, r *http.Request)
     w.Header().Set("Content-Type", "application/json")
 
     var latestHeight uint64
-    
+
     // Taktik: Gunakan &latestHeight sebagai argumen kedua 
     // agar Store langsung mengisi nilainya ke variabel tersebut.
     err := h.Store.Get("latest_height", &latestHeight)
-    
+
     if err != nil {
         // Jika gagal (key tidak ditemukan), biarkan 0 atau gunakan angka terakhir
         latestHeight = 0 
@@ -300,30 +363,26 @@ func (h *NexusHandler) HandleCreateWallet(w http.ResponseWriter, r *http.Request
 }
 
 func (h *NexusHandler) HandleAddressHistory(w http.ResponseWriter, r *http.Request) {
-    // 1. Ambil query dari Wallet (q atau address)
-    query := r.URL.Query().Get("q")
-    if query == "" {
-        query = r.URL.Query().Get("address")
+    address := r.URL.Query().Get("address")
+    if address == "" { address = r.URL.Query().Get("q") }
+
+    fmt.Printf("🕵️ [NEXUS-CRAWLER] Membaca riwayat lokal untuk: %s\n", address[:8])
+
+    // 1. Ambil riwayat dari database lokal Nexus
+    var history []types.Transaction
+    err := h.Store.Get("h:"+address, &history)
+
+    // 2. Jika tidak ada di lokal, baru coba tanya ke Core (sebagai cadangan)
+    if err != nil || len(history) == 0 {
+        targetURL := fmt.Sprintf("%s/api/history?address=%s", h.CoreURL, address)
+        resp, errR := http.Get(targetURL)
+        if errR == nil {
+            defer resp.Body.Close()
+            json.NewDecoder(resp.Body).Decode(&history)
+        }
     }
 
-    // 2. Tanya ke Core (Port 8080)
-    // Gunakan rute /api/history yang ada di router.go Core Jenderal
-    resp, err := http.Get(h.CoreURL + "/api/history?address=" + query)
-    if err != nil {
-        http.Error(w, "Core Offline", 502)
-        return
-    }
-    defer resp.Body.Close()
-
-    // 3. Decode data mentah dari Core (satuan uint64)
-    var coreTxs []types.Transaction
-    if err := json.NewDecoder(resp.Body).Decode(&coreTxs); err != nil {
-        // Jika gagal decode array, mungkin Core kirim error
-        io.Copy(w, resp.Body)
-        return
-    }
-
-    // 4. MAPPING SULTAN: Ubah ke format TransactionMetadata (float64)
+    // 3. Mapping ke format Dashboard Sultan
     type TransactionMetadata struct {
         ID        string  `json:"id"`
         From      string  `json:"from"`
@@ -336,12 +395,12 @@ func (h *NexusHandler) HandleAddressHistory(w http.ResponseWriter, r *http.Reque
     }
 
     var result []TransactionMetadata
-    for _, tx := range coreTxs {
+    for _, tx := range history {
         result = append(result, TransactionMetadata{
             ID:        tx.ID,
             From:      tx.From,
             To:        tx.To,
-            Amount:    float64(tx.Amount) / 100000000.0, // Konversi ke desimal
+            Amount:    float64(tx.Amount) / 100000000.0,
             Symbol:    tx.Symbol,
             Memo:      tx.Memo,
             Timestamp: tx.Timestamp,
@@ -351,4 +410,79 @@ func (h *NexusHandler) HandleAddressHistory(w http.ResponseWriter, r *http.Reque
 
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(result)
+}
+
+func (h *NexusHandler) HandleGetState(w http.ResponseWriter, r *http.Request) {
+    address := r.URL.Query().Get("address")
+    type StateCache struct { Balance uint64; Nonce uint64 }
+    var cache StateCache
+
+    // 1. Ambil dari lokal
+    err := h.Store.Get("s:"+address, &cache)
+
+    // Siapkan variabel temp dengan nilai dari cache (jika ada)
+    balance := cache.Balance
+    nonce := cache.Nonce
+
+    // 🚩 2. SYARAT AGRESIF: Tarik dari Core jika saldo lokal masih 0
+    if err != nil || balance == 0 || nonce == 0 {
+        fmt.Printf("🔄 [NEXUS] Sinkronisasi saldo asli %s (Lokal: %d)...\n", address[:8], balance)
+
+        targetURL := fmt.Sprintf("%s/api/balance?address=%s", h.CoreURL, address)
+        resp, errR := http.Get(targetURL)
+        if errR == nil {
+            defer resp.Body.Close()
+            var rawData map[string]interface{}
+            if errD := json.NewDecoder(resp.Body).Decode(&rawData); errD == nil {
+                // Ambil balance_atomic
+                if val, ok := rawData["balance_atomic"]; ok {
+                    balance = convertToUint64(val)
+                }
+                // Ambil nonce
+                if nVal, ok := rawData["nonce"]; ok {
+                    nonce = convertToUint64(nVal)
+                }
+
+                // 🎯 SIMPAN HANYA JIKA HASIL DARI CORE > 0
+                if balance > 0 || nonce > 0 {
+                    h.Store.Put("s:"+address, StateCache{Balance: balance, Nonce: nonce})
+                    fmt.Printf("✅ [NEXUS] Intelijen Berhasil! Bal: %d | Nonce: %d\n", balance, nonce)
+                    // Update cache untuk respon JSON
+                    cache.Balance = balance
+                    cache.Nonce = nonce
+                }
+            }
+        }
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "address": address,
+        "balance": cache.Balance,
+        "nonce":   cache.Nonce,
+        "source":  "NEXUS_SYNCED_DATA",
+    })
+}
+
+
+// HandleBalance menjawab permintaan Saldo spesifik
+func (h *NexusHandler) HandleBalance(w http.ResponseWriter, r *http.Request) {
+    fmt.Println("💰 [NEXUS] Meminta Saldo dari Core...")
+    h.HandleProxyMining(w, r)
+}
+
+// Fungsi pembantu untuk konversi segala jenis tipe data JSON ke uint64
+func convertToUint64(v interface{}) uint64 {
+    switch t := v.(type) {
+    case float64:
+        return uint64(t)
+    case string:
+        // Jika saldo dikirim sebagai string "1000"
+        var res uint64
+        fmt.Sscanf(t, "%d", &res)
+        return res
+    case uint64:
+        return t
+    }
+    return 0
 }
