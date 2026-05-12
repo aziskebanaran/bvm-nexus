@@ -8,31 +8,28 @@ import (
     "time"
 )
 
-// StartRelayer akan berjalan di background untuk mengirim TX ke Core
 func StartRelayer(m *NexusMempool, coreURL string) {
-    fmt.Println("🚀 [RELAYER] Mempool Relayer aktif. Siap menyetor transaksi ke Core...")
-    
+    fmt.Println("🚀 [RELAYER] Sentinel Sequencer Aktif...")
+
     for {
-        time.Sleep(2 * time.Second) // Setoran setiap 2 detik
+        time.Sleep(3 * time.Second) // Batching setiap 3 detik
 
         txs := m.Flush()
-        if len(txs) == 0 {
-            continue
-        }
+        if len(txs) == 0 { continue }
 
-        // Kirim batch transaksi ke endpoint mempool Core
         jsonData, _ := json.Marshal(txs)
         resp, err := http.Post(coreURL+"/api/mempool/batch", "application/json", bytes.NewBuffer(jsonData))
-        
-        if err != nil {
-            fmt.Printf("⚠️ [RELAYER] Gagal setoran: Core Offline (%v)\n", err)
-            // Opsional: Jika gagal, masukkan kembali txs ke mempool (Retry)
+
+        if err != nil || resp.StatusCode != http.StatusOK {
+            fmt.Printf("⚠️ [RELAYER] Core Sibuk. Mengembalikan %d tx ke antrean...\n", len(txs))
+            // Masukkan kembali ke mempool agar tidak hilang
+            for _, tx := range txs {
+                m.AddL2(tx) 
+            }
             continue
         }
         
-        if resp.StatusCode == http.StatusOK {
-            fmt.Printf("✅ [RELAYER] Berhasil menyetor %d transaksi ke Core.\n", len(txs))
-        }
+        fmt.Printf("✅ [RELAYER] %d Transaksi L2 berhasil dipahat ke Core L1.\n", len(txs))
         resp.Body.Close()
     }
 }

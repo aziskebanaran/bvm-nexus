@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# --- CONFIGURATION ---
+NEXUS_URL="http://localhost:9092"
+COLOR_GOLD='\033[0;33m'
+COLOR_RESET='\033[0m'
+
+function usage() {
+    echo -e "${COLOR_GOLD}Usage:${COLOR_RESET} ./nexuscli [command] [options]"
+    echo "Commands:"
+    echo "  buy --id [ASSET_ID] --from [ADDR]  | Membeli aset dari Market"
+    echo "  stats                               | Melihat statistik mining"
+    echo "  inventory [ADDR]                   | Cek tas/inventaris user"
+    exit 1
+}
+
+if [ "$1" == "buy" ]; then
+    ASSET_ID=$3
+    FROM_ADDR=$5
+    echo -e "🛒 [MARKET] Mengirim perintah pembelian untuk $ASSET_ID..."
+    curl -s "$NEXUS_URL/api/market/buy?id=$ASSET_ID&from=$FROM_ADDR" | jq .
+elif [ "$1" == "stats" ]; then
+    curl -s "$NEXUS_URL/api/mining-stats" | jq .
+elif [ "$1" == "inventory" ]; then
+    curl -s "$NEXUS_URL/api/inventory/$2" | jq .
+else
+    usage
+fi

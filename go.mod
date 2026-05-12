@@ -3,7 +3,8 @@ module github.com/aziskebanaran/bvm-nexus
 go 1.26.2
 
 require (
-	github.com/aziskebanaran/bvm-core v1.1.26
+	github.com/aziskebanaran/bvm-core v1.1.27
+	github.com/aziskebanaran/bvm-lib v1.0.3
 	github.com/hashicorp/mdns v1.0.6
 	github.com/ipfs/go-log/v2 v2.5.1
 	github.com/libp2p/go-libp2p v0.32.0
@@ -48,7 +49,6 @@ require (
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
 	github.com/jbenet/goprocess v0.1.4 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/klauspost/compress v1.17.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
@@ -127,3 +127,5 @@ require (
 replace github.com/aziskebanaran/bvm-core => ../bvm-core
 
 replace github.com/aziskebanaran/bvm-lib => ../bvm-lib
+
+replace github.com/aziskebanaran/xbank => ../xbank

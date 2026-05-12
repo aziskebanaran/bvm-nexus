@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"sort"
     "encoding/json"
     "io"
     "net/http"
@@ -8,18 +9,26 @@ import (
 	"os"
     "fmt" // Tambahkan ini
 	"strings"
+
+    "github.com/aziskebanaran/bvm-lib/constants"
+    "github.com/aziskebanaran/bvm-lib/utils"
     "github.com/aziskebanaran/bvm-core/pkg/client"
-    "github.com/aziskebanaran/bvm-core/pkg/wallet"
     "github.com/aziskebanaran/bvm-nexus/pkg/p2p" // Tambahkan ini (panggil p2p nexus)
     "github.com/aziskebanaran/bvm-core/pkg/storage"
-    "github.com/aziskebanaran/bvm-core/x/bvm/types"
+    "github.com/aziskebanaran/bvm-core/x/bvm/types" 
     "github.com/libp2p/go-libp2p/core/crypto" // Tambahkan ini
+    "github.com/aziskebanaran/bvm-nexus/pkg/rpc/user"
+    "github.com/aziskebanaran/bvm-nexus/pkg/mempool"
+    "github.com/aziskebanaran/bvm-nexus/pkg/utxo"
 )
 
 type NexusHandler struct {
     Store      storage.BVMStore
+    UTXOStore *utxo.UTXOStore
     CoreURL    string
     CoreClient *client.BVMClient
+    Mempool    *mempool.NexusMempool
+
 }
 
 func (h *NexusHandler) HandleProxyMining(w http.ResponseWriter, r *http.Request) {
@@ -79,12 +88,16 @@ func (h *NexusHandler) HandleGetTx(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    fmt.Printf("🕵️ [NEXUS] Mencari detail transaksi: %s\n", txid[:10])
+    displayID := txid
+    if len(txid) >= 10 {
+        displayID = txid[:10]
+    }
+    fmt.Printf("🕵️ [NEXUS] Mencari detail transaksi: %s\n", displayID)
 
     // 1. Cek Database Lokal Nexus (Hasil Crawling)
     var tx types.Transaction
     // Gunakan prefix "tx:" sesuai yang kita buat di sync.go tadi
-    err := h.Store.Get("tx:"+txid, &tx)
+    err := h.Store.Get(utils.BuildCoreKey(constants.DBTxPrefix, txid), &tx)
 
     if err == nil && tx.ID != "" {
         w.Header().Set("Content-Type", "application/json")
@@ -122,7 +135,7 @@ func (h *NexusHandler) HandleGetBlock(w http.ResponseWriter, r *http.Request) {
 
     var block types.Block
     // Prefix "b:" adalah standar storage untuk blok
-    err := h.Store.Get("b:"+heightStr, &block)
+    err := h.Store.Get(utils.BuildCoreKey(constants.DBBlockPrefix, heightStr), &block)
 
     if err != nil || block.Hash == "" {
         // Fallback: Jika tidak ada di Nexus, lempar ke Core
@@ -341,48 +354,54 @@ func (h *NexusHandler) HandleGetBalance(w http.ResponseWriter, r *http.Request) 
 }
 
 
-func (h *NexusHandler) HandleCreateWallet(w http.ResponseWriter, r *http.Request) {
-    // 1. Panggil fungsi asli dari Core Go Jenderal
-    // Ini akan menghasilkan alamat 'bvmf...' dengan hash 10 bytes yang sah
-    newW, mnemonic, err := wallet.CreateNewWallet()
-    if err != nil {
-        w.WriteHeader(http.StatusInternalServerError)
-        json.NewEncoder(w).Encode(map[string]string{"error": "Gagal mencetak wallet resmi"})
-        return
+func (h *NexusHandler) HandleAddressHistory(w http.ResponseWriter, r *http.Request) {
+    query := r.URL.Query().Get("q")
+    if query == "" {
+        query = r.URL.Query().Get("address")
     }
 
-    // 2. Kirim data resmi ke SDK (TS)
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]interface{}{
-        "address":     newW.Address,
-        "private_key": newW.PrivateKey,
-        "public_key":  newW.PublicKey,
-        "mnemonic":    mnemonic,
-        "status":      "OFFICIAL_BVM_CORE",
-    })
-}
+    finalAddress := query
+    var resolved string
+    // Resolusi mapping (0x atau @ ke bvmf)
+    if err := h.Store.Get("id:"+query, &resolved); err == nil && resolved != "" {
+        finalAddress = resolved
+    }
 
-func (h *NexusHandler) HandleAddressHistory(w http.ResponseWriter, r *http.Request) {
-    address := r.URL.Query().Get("address")
-    if address == "" { address = r.URL.Query().Get("q") }
+    displayID := finalAddress
+    if len(finalAddress) > 8 { displayID = finalAddress[:8] }
+    fmt.Printf("🕵️ [NEXUS-INTEL] Memindai riwayat untuk: %s...\n", displayID)
 
-    fmt.Printf("🕵️ [NEXUS-CRAWLER] Membaca riwayat lokal untuk: %s\n", address[:8])
-
-    // 1. Ambil riwayat dari database lokal Nexus
     var history []types.Transaction
-    err := h.Store.Get("h:"+address, &history)
 
-    // 2. Jika tidak ada di lokal, baru coba tanya ke Core (sebagai cadangan)
-    if err != nil || len(history) == 0 {
-        targetURL := fmt.Sprintf("%s/api/history?address=%s", h.CoreURL, address)
+    // 1. Coba ambil dari lokal Nexus
+    h.Store.Get(utils.BuildNexusKey(constants.PrefixHistory, finalAddress), &history)
+
+    // 2. 🚩 FORCE SYNC: Jika lokal masih kosong, tarik dari Core
+    if len(history) == 0 {
+        fmt.Printf("🔄 [NEXUS] Memaksa Sinkronisasi Core untuk: %s\n", displayID)
+
+        targetURL := fmt.Sprintf("%s/api/history?address=%s", h.CoreURL, finalAddress)
         resp, errR := http.Get(targetURL)
         if errR == nil {
             defer resp.Body.Close()
-            json.NewDecoder(resp.Body).Decode(&history)
+
+            var remoteHistory []types.Transaction
+            if errD := json.NewDecoder(resp.Body).Decode(&remoteHistory); errD == nil && len(remoteHistory) > 0 {
+                // 💾 SIMPAN KE ALAMAT ASLI (finalAddress)
+                h.Store.Put("h:"+finalAddress, remoteHistory)
+                history = remoteHistory
+                fmt.Printf("✅ [NEXUS] %d transaksi Sultan diarsipkan!\n", len(history))
+            }
         }
     }
 
-    // 3. Mapping ke format Dashboard Sultan
+    // Tambahan: Jika query tidak sama dengan finalAddress (misal query pakai 0x), 
+    // simpan juga mapping history-nya agar pencarian lewat 0x juga cepat.
+    if query != finalAddress && len(history) > 0 {
+        h.Store.Put("h:"+query, history)
+    }
+
+    // --- 🚩 STAGE 3: MAPPING KE DASHBOARD (Tetap) ---
     type TransactionMetadata struct {
         ID        string  `json:"id"`
         From      string  `json:"from"`
@@ -394,7 +413,7 @@ func (h *NexusHandler) HandleAddressHistory(w http.ResponseWriter, r *http.Reque
         Type      string  `json:"type"`
     }
 
-    var result []TransactionMetadata
+    var result []TransactionMetadata = make([]TransactionMetadata, 0) // Pastikan [] bukan null
     for _, tx := range history {
         result = append(result, TransactionMetadata{
             ID:        tx.ID,
@@ -412,13 +431,20 @@ func (h *NexusHandler) HandleAddressHistory(w http.ResponseWriter, r *http.Reque
     json.NewEncoder(w).Encode(result)
 }
 
+
 func (h *NexusHandler) HandleGetState(w http.ResponseWriter, r *http.Request) {
     address := r.URL.Query().Get("address")
+
+    if address == "" {
+        http.Error(w, `{"error": "Address is required"}`, http.StatusBadRequest)
+        return
+    }
+
     type StateCache struct { Balance uint64; Nonce uint64 }
     var cache StateCache
 
     // 1. Ambil dari lokal
-    err := h.Store.Get("s:"+address, &cache)
+    err := h.Store.Get(utils.BuildNexusKey(constants.PrefixState, address), &cache)
 
     // Siapkan variabel temp dengan nilai dari cache (jika ada)
     balance := cache.Balance
@@ -426,9 +452,16 @@ func (h *NexusHandler) HandleGetState(w http.ResponseWriter, r *http.Request) {
 
     // 🚩 2. SYARAT AGRESIF: Tarik dari Core jika saldo lokal masih 0
     if err != nil || balance == 0 || nonce == 0 {
-        fmt.Printf("🔄 [NEXUS] Sinkronisasi saldo asli %s (Lokal: %d)...\n", address[:8], balance)
+
+        displayAddr := address
+        if len(address) >= 8 {
+            displayAddr = address[:8]
+        }
+
+        fmt.Printf("🔄 [NEXUS] Sinkronisasi saldo asli %s (Lokal: %d)...\n", displayAddr, balance)
 
         targetURL := fmt.Sprintf("%s/api/balance?address=%s", h.CoreURL, address)
+
         resp, errR := http.Get(targetURL)
         if errR == nil {
             defer resp.Body.Close()
@@ -464,6 +497,52 @@ func (h *NexusHandler) HandleGetState(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+func (h *NexusHandler) HandleSearch(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		http.Error(w, `{"error": "Query is required"}`, 400)
+		return
+	}
+
+	// 1. Logika Resolusi Identitas (Mapping Pintar)
+	// Kita tentukan alamat dasar (bvmf) dari input @username, 0x, atau alamat asli
+	finalAddr := query
+	var resolved string
+
+	// Cek database identitas Nexus
+	if err := h.Store.Get("id:"+query, &resolved); err == nil && resolved != "" {
+		finalAddr = resolved
+	}
+
+	// 🚩 2. PANGGIL MESIN METADATA
+	// Ini akan otomatis mengambil Saldo (s:), Nonce (n:), History (h:), dan UTXO
+	metadata := h.BuildWalletMetadata(finalAddr)
+
+	// 3. RAKIT RESPON TERPADU (Sinkron dengan Wallet CLI)
+	// Pastikan semua key string sesuai dengan yang dipanggil bvm-wallet search
+	report := map[string]interface{}{
+		"query":           query,
+		"resolved_addr":   metadata.Address,       // Mencegah <nil> di Alamat Asli
+		"eth_addr":        metadata.MappedAddress, // Alamat 0x pasangannya
+		"balance_atomic":  metadata.BalanceAtomic,
+		"balance_bvm":     float64(metadata.BalanceAtomic) / 100000000.0,
+		"nonce":           metadata.Nonce,
+		"utxo_count":      metadata.UTXOCount,
+		"tx_count":        metadata.ActivityCount,
+		"status":          "ACTIVE",
+	}
+
+	// Sertakan aktivitas terakhir jika ada
+	if metadata.LastSeen > 0 {
+		report["last_activity"] = metadata.LastSeen
+		report["last_memo"]     = metadata.LastMemo
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Sentinel-Source", "NEXUS-INTEL-L2")
+	json.NewEncoder(w).Encode(report)
+}
+
 
 // HandleBalance menjawab permintaan Saldo spesifik
 func (h *NexusHandler) HandleBalance(w http.ResponseWriter, r *http.Request) {
@@ -485,4 +564,132 @@ func convertToUint64(v interface{}) uint64 {
         return t
     }
     return 0
+}
+
+
+func (h *NexusHandler) HandleGetHolders(w http.ResponseWriter, r *http.Request) {
+    fmt.Println("🏆 [NEXUS] Menyusun Daftar Elit BVM (Rich List)...")
+
+    // 1. Ambil data mentah dari Core
+    resp, err := http.Get(h.CoreURL + "/api/holders")
+    if err != nil {
+        http.Error(w, "Core Offline", 502)
+        return
+    }
+    defer resp.Body.Close()
+
+    var rawHolders map[string]map[string]int64
+    json.NewDecoder(resp.Body).Decode(&rawHolders)
+
+    // 2. Transformasi ke Array agar bisa di-Sort
+    type HolderInfo struct {
+        Address  string  `json:"address"`
+        Username string  `json:"username"`
+        Balance  float64 `json:"balance"`
+    }
+    var eliteList []HolderInfo
+
+    for addr, assets := range rawHolders {
+        balanceUnit := assets["BVM"]
+
+        // Lewati yang saldonya 0 atau alamat sistem internal jika ingin bersih
+        if balanceUnit <= 0 || len(addr) > 60 { continue }
+
+        // 🔍 Cek apakah alamat ini punya Username di database Nexus
+        var username string
+        if errU := h.Store.Get("name:"+addr, &username); errU != nil {
+            username = "Anonymous Holder"
+        }
+
+        eliteList = append(eliteList, HolderInfo{
+            Address:  addr,
+            Username: username,
+            Balance:  float64(balanceUnit) / 100000000.0, // Konversi ke BVM
+        })
+    }
+
+    // 3. SORTING: Terkaya di atas!
+    sort.Slice(eliteList, func(i, j int) bool {
+        return eliteList[i].Balance > eliteList[j].Balance
+    })
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "network": "BVM-Mainnet",
+        "total_holders": len(eliteList),
+        "holders": eliteList,
+    })
+}
+
+
+// Implementasi Helper Tinggi Blok
+func (h *NexusHandler) GetLocalHeight() uint64 {
+    var height uint64
+    h.Store.Get("latest_height", &height)
+    return height
+}
+
+// Perbaikan Distribusi Reward Miner
+func (h *NexusHandler) CalculateMinerBonus(systemBalance uint64) uint64 {
+    // Gunakan GetNetworkInfo karena GetParams tidak ada
+    info, err := h.CoreClient.GetNetworkInfo()
+    if err != nil { return 0 }
+    
+    params := info.Params
+    currentHeight := h.GetLocalHeight()
+    
+    blocksLeft := int64(params.HalvingInterval) - (int64(currentHeight) % int64(params.HalvingInterval))
+    if blocksLeft <= 0 { return 0 }
+    
+    return systemBalance / uint64(blocksLeft)
+}
+
+
+
+func (h *NexusHandler) HandleRenderAsset(w http.ResponseWriter, r *http.Request) {
+    // Ambil ID setelah /api/render/
+    parts := strings.Split(r.URL.Path, "/")
+    id := ""
+    if len(parts) > 3 {
+        id = parts[3]
+    }
+
+    // Panggil unit renderer
+    user.ExecuteRender(w, id)
+}
+
+
+// PostReportHash: Miner melaporkan hasil patrolinya (Versi Standard http)
+func (h *NexusHandler) PostReportHash(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Metode dilarang, Jenderal!", http.StatusMethodNotAllowed)
+        return
+    }
+
+    var req struct {
+        MinerAddr string  `json:"miner_addr"`
+        Hashes    uint64  `json:"hashes"`
+        Duration  float64 `json:"duration"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "Laporan cacat", http.StatusBadRequest)
+        return
+    }
+
+    // Masukkan ke Stats Manager (GlobalStats harus bisa diakses di sini)
+    GlobalStats.UpdateStat(req.MinerAddr, req.Hashes, req.Duration)
+    
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"status": "Laporan diterima, Jenderal!"})
+}
+
+// GetMiningStats: Dashboard statistik
+func (h *NexusHandler) GetMiningStats(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "global_hashrate": GlobalStats.GetGlobalHashrate(),
+        "active_miners":   len(GlobalStats.Miners),
+        "timestamp":       time.Now().Unix(),
+    })
 }
